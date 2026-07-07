@@ -1,4 +1,6 @@
 import os
+import time
+import random
 import argparse
 import matplotlib.pyplot as plt
 
@@ -18,12 +20,16 @@ parser.add_argument('--downsamplex', type=int, default=1)
 parser.add_argument('--downsampley', type=int, default=1)
 parser.add_argument('--mlp_ratio', type=int, default=1)
 parser.add_argument('--dropout', type=float, default=0.0)
+parser.add_argument('--ntrain', type=int, default=1000)
 parser.add_argument('--unified_pos', type=int, default=0)
 parser.add_argument('--ref', type=int, default=8)
 parser.add_argument('--slice_num', type=int, default=32)
 parser.add_argument('--eval', type=int, default=0)
 parser.add_argument('--save_name', type=str, default='pipe_UniPDE')
 parser.add_argument('--data_path', type=str, default='/data/fno/pipe')
+parser.add_argument('--optimizer', type=str, choices=['adamw', 'soap'], default='adamw')
+parser.add_argument('--seed', type=int, default=0)
+parser.add_argument('--soap-precondition-frequency', type=int, default=10)
 args = parser.parse_args()
 eval = args.eval
 save_name = args.save_name
@@ -36,6 +42,19 @@ from tqdm import *
 from utils.testloss import TestLoss
 from model_dict import get_model
 from utils.normalizer import UnitTransformer
+from optimizers.soap import SOAP
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(args.seed)
 
 
 def count_parameters(model):
@@ -53,9 +72,11 @@ def main():
     INPUT_Y = args.data_path + '/Pipe_Y.npy'
     OUTPUT_Sigma = args.data_path + '/Pipe_Q.npy'
 
-    ntrain = 1000
+    ntrain = args.ntrain
     ntest = 200
     N = 1200
+    if ntrain + ntest > N:
+        raise ValueError("ntrain + ntest must be <= 1200 for the Pipe benchmark split")
 
     r1 = args.downsamplex
     r2 = args.downsampley
@@ -113,8 +134,15 @@ def main():
                                   unified_pos=args.unified_pos,
                                   H=s1, W=s2).cuda()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == "soap":
+        optimizer = SOAP(model.parameters(), lr=args.lr, betas=(0.95, 0.95), eps=1e-8,
+                         weight_decay=args.weight_decay,
+                         precondition_frequency=args.soap_precondition_frequency)
 
+    print("Optimizer={}, seed={}, lr={}, weight_decay={}".format(
+        args.optimizer, args.seed, args.lr, args.weight_decay))
     print(args)
     print(model)
     count_parameters(model)
@@ -196,12 +224,18 @@ def main():
         rel_err /= ntest
         print("rel_err:{}".format(rel_err))
     else:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        run_start = time.perf_counter()
+
         for ep in range(args.epochs):
 
             model.train()
             train_loss = 0
 
-            for pos, fx, y in train_loader:
+            for batch_idx, (pos, fx, y) in enumerate(train_loader):
+                if ep == 0 and batch_idx < 3:
+                    print("LR:", optimizer.param_groups[0]["lr"])
 
                 x, fx, y = pos.cuda(), fx.cuda(), y.cuda()  # x:B,N,2  fx:B,N,2  y:B,N
                 optimizer.zero_grad()
@@ -242,6 +276,10 @@ def main():
                     os.makedirs('./checkpoints')
                 print('save model')
                 torch.save(model.state_dict(), os.path.join('./checkpoints', save_name + '.pt'))
+
+        torch.cuda.synchronize()
+        print("Total runtime seconds: {:.2f}".format(time.perf_counter() - run_start))
+        print("Peak GPU memory MB: {:.2f}".format(torch.cuda.max_memory_allocated() / 1024 ** 2))
 
         if not os.path.exists('./checkpoints'):
             os.makedirs('./checkpoints')
