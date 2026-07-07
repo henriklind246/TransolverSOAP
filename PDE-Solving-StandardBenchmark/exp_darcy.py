@@ -149,7 +149,7 @@ def main():
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer == "soap":
-        optimizer = SOAP(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-8,
+        optimizer = SOAP(model.parameters(), lr=args.lr, betas=(0.95, 0.95), eps=1e-8,
                          weight_decay=args.weight_decay,
                          precondition_frequency=args.soap_precondition_frequency)
 
